@@ -26,7 +26,7 @@ Carry this out two ways:
 
 Generate at least 1,000 bootstrapped samples. Report the performance difference between the versions.
 
-(Note: On my computer, this code runs for about 15-20 minutes. If yours takes substantially longer than that, I\'d recommend spending some time seeing if you can obtain any speed gains. It might help to start with a smaller number of replicates to develop the code and optimize performance prior to running the longer job.)
+(Note: On my computer, this code runs for about 15-20 minutes. If yours takes substantially longer than that, I'd recommend spending some time seeing if you can obtain any speed gains. It might help to start with a smaller number of replicates to develop the code and optimize performance prior to running the longer job.)
 
 First, let's try to do this without any parallel processing and start by loading the data:
 
@@ -34,5 +34,91 @@ First, let's try to do this without any parallel processing and start by loading
 library(nycflights13)
 library(tidyverse)
 library(dplyr)
+library(purrr)
+library(broom)
+library(boot)
+library(parallel)
+library(doParallel)
+library(foreach)
+library(tidyr)
+library(future.apply)
 flights <- flights
+```
+
+Second, let's set the number of bootstrap samples that we want to use. Dr. Erickson says at least $1,000$ so I will use $1,001$.
+
+```{r}
+num_bootstraps <- 1001
+```
+
+Third, I am going to use pipes to stratify by `dest` to estimate the `air_time` for flights from each `origin`:
+
+```{r}
+bootstrap_results <- flights %>% 
+  group_by(origin, dest) %>%
+  nest() %>% # each element in list (by origin, dest) will contain subset of data for specific     combination of origin and dest
+  mutate(
+    bootstrap_samples = map(data, ~replicate(num_bootstraps, sample(.x$air_time, replace = TRUE))),
+    mean_air_time = map_dbl(bootstrap_samples, ~mean(.x, na.rm=TRUE)), # map_dbl is a variant of map specifically designed for mapping functions that return double values.
+    confidence_intervals = map(bootstrap_samples, ~quantile(.x, c(0.025, 0.975), na.rm = TRUE))
+  ) %>%
+  unnest_wider(confidence_intervals) %>%
+  rename(lower_ci = `2.5%`, upper_ci = `97.5%`) %>%
+  filter(!is.nan(mean_air_time)) %>%
+  select(origin, dest, mean_air_time, lower_ci, upper_ci)
+```
+
+Fourth, I am going to produce a table including the estimates and confidence intervals for each `origin`:
+
+```{r}
+summary_table <- bootstrap_results %>%
+  group_by(origin) %>%
+  summarize(
+    mean_air_time = mean(mean_air_time),
+    lower_ci = min(lower_ci),
+    upper_ci = max(upper_ci)
+  )
+
+# Print or view the summary table
+print(summary_table)
+```
+
+Second, let's try to do this with parallel processing. I couldn't figure out how to pivot the df that I generated below to wide format for a concise table. If I have some time in the next few days, I will keep trying. I note that I got help from ChatGPT:
+
+```{r}
+
+stratified_bootstrapping <- function(origin_data){
+  dests <- unique(origin_data$dest)
+  
+  calculate_avg_air_time <- function(dest_data){
+     if (any(is.na(dest_data$air_time))) {
+    # Handle missing values by excluding them from the calculation
+    dest_data <- na.omit(dest_data)
+  }
+    boot_samples <- replicate(2, mean(sample(dest_data$air_time, replace = TRUE)))
+    ci <- quantile(boot_samples, c(0.025, 0.975))
+    return(c(estimate = mean(boot_samples), ci_low = ci[1], ci_high = ci[2]))
+  }
+  results <- lapply(dests, function(dest){
+    dest_data <- subset(origin_data, dest == origin_data$dest)
+    return(cbind(dest = dest, calculate_avg_air_time(dest_data)))
+  })
+  return(do.call(rbind, results))
+}
+origins <- unique(flights$origin)
+cl <- makeCluster(detectCores())
+clusterExport(cl, c("flights", "origins", "stratified_bootstrapping"))
+clusterEvalQ(cl, library(nycflights13))
+
+results <- parLapply(cl, origins, function(origin) {
+  origin_data <- subset(flights, origin == flights$origin)
+  return(stratified_bootstrapping(origin_data))
+})
+
+stopCluster(cl)
+
+final_table <- do.call(rbind, Map(cbind, origin = origins, results))
+
+final_table_df <- data.frame(final_table)
+final_table_df
 ```
